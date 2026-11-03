@@ -72,7 +72,11 @@ pub fn scan_root(root: &Path, cfg: &ScanConfig, db: &ThreatDb, log: &EventLog) -
         if !entry.file_type().is_file() {
             continue;
         }
-        let meta = match entry.metadata() {
+        // Ask the file itself, not the directory listing: on Windows walkdir's
+        // entry metadata comes from the directory, where NTFS may still show
+        // 0 bytes for a file another process has open (e.g. a dropper still
+        // writing its payload), and the file would be skipped as empty.
+        let meta = match std::fs::metadata(entry.path()) {
             Ok(m) => m,
             Err(_) => continue,
         };
