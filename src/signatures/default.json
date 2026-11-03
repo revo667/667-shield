@@ -1,0 +1,40 @@
+{
+  "version": "2026.11.03",
+  "note": "Default IOC signature set for 667 Shield. Override at runtime with a user signatures file. Treat as a starting baseline, not an exhaustive blocklist.",
+  "c2_domains": [
+    "exo-api.tf",
+    "darkside.cy",
+    "devruntime.cy",
+    "exo-api.cy"
+  ],
+  "exfil_hosts": [
+    "gofile.io",
+    "file.io",
+    "transfer.sh",
+    "filebin.net",
+    "tmpfiles.org",
+    "0x0.st",
+    "catbox.moe",
+    "uguu.se",
+    "oshi.at",
+    "bashupload.com",
+    "anonfiles.com",
+    "api.telegram.org"
+  ],
+  "c2_ports": [1337, 4444, 5555, 6666, 7777, 31337],
+  "stealer_process_names": [
+    "berok.exe",
+    "retev.exe",
+    "exo.exe",
+    "devruntime.exe",
+    "grabber.exe",
+    "stealer.exe"
+  ],
+  "stealer_name_fragments": [
+    "grabber",
+    "stealer",
+    "clipper",
+    "injector",
+    "exfil"
+  ]
+}
