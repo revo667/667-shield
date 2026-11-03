@@ -64,6 +64,25 @@ tiny in RAM. A legacy native window is still available behind a cargo feature
 Some actions need elevated rights: `hosts enable/disable`, the panic switch and
 Windows firewall rules require admin/root.
 
+### Windows builds (CI)
+
+[`.github/workflows/windows-build.yml`](.github/workflows/windows-build.yml)
+builds the Windows exe on a `windows-latest` runner for every push to `main`
+and every pull request: it runs `cargo test`, `cargo clippy --all-targets -- -D
+warnings` and `cargo build --release`.
+
+- **Latest build:** open the [Actions tab](https://github.com/revo667/667-shield/actions/workflows/windows-build.yml),
+  pick a green run and download the `shield667-windows-x86_64` artifact
+  (needs a GitHub login; artifacts expire after 90 days).
+- **Releases:** pushing a `v*` tag (e.g. `git tag v0.1.0 && git push origin
+  v0.1.0`) also attaches `shield667-<tag>-windows-x86_64.zip` to the
+  [GitHub Release](https://github.com/revo667/667-shield/releases) for that tag.
+
+Both contain `shield667.exe` with `vendor/goodbyedpi/` next to it. Keep that
+layout when you unpack: the exe finds the DPI-bypass engine through
+`vendor/goodbyedpi` beside itself. Double-click `shield667.exe` to start
+protection and open the dashboard, as described above.
+
 ## Platform status
 
 | Capability | macOS / Linux | Windows |

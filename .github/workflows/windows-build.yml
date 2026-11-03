@@ -1,0 +1,94 @@
+# Builds shield667.exe on a real Windows runner, runs the test suite and
+# clippy there, and uploads the exe together with the vendored GoodbyeDPI
+# engine. On a `v*` tag the same bundle is zipped onto a GitHub Release.
+
+name: Windows build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Build (x86_64-pc-windows-msvc)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build release
+        run: cargo build --release
+
+      # dpi::vendor_dir looks for vendor/goodbyedpi next to the exe, so the
+      # bundle keeps that layout.
+      - name: Stage bundle
+        shell: pwsh
+        run: |
+          $out = "dist/shield667"
+          New-Item -ItemType Directory -Force -Path "$out/vendor" | Out-Null
+          Copy-Item target/release/shield667.exe $out
+          Copy-Item -Recurse vendor/goodbyedpi "$out/vendor/"
+          Copy-Item LICENSE $out
+          foreach ($f in "shield667.exe", "vendor/goodbyedpi/blacklist.txt", "vendor/goodbyedpi/x86_64/goodbyedpi.exe") {
+            if (-not (Test-Path "$out/$f")) { throw "bundle is missing $f" }
+          }
+          Get-ChildItem -Recurse $out | Select-Object FullName, Length
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: shield667-windows-x86_64
+          path: dist/shield667/
+          if-no-files-found: error
+
+  release:
+    name: Attach to release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: shield667-windows-x86_64
+          path: shield667
+
+      - name: Zip and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          zip_name="shield667-${TAG}-windows-x86_64.zip"
+          zip -r "$zip_name" shield667
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$zip_name" --clobber
+          else
+            gh release create "$TAG" "$zip_name" --title "667 Shield $TAG" --generate-notes --verify-tag
+          fi
