@@ -257,7 +257,7 @@ impl eframe::App for ShieldApp {
                 });
                 ui.separator();
                 egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
-                    for ev in self.log.snapshot().iter().rev().take(300).rev() {
+                    for ev in &self.log.tail(300) {
                         let color = match ev.severity {
                             Severity::Info => Color32::GRAY,
                             Severity::Warn => Color32::from_rgb(230, 200, 60),

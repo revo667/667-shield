@@ -44,6 +44,7 @@ struct Candidate {
     gecko_profiles_dir: Option<PathBuf>,
 }
 
+#[cfg(not(windows))]
 fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }

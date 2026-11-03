@@ -21,7 +21,7 @@ pub struct Finding {
 /// Scan the current process table once, returning everything that matches a
 /// stealer indicator. `sys` is reused across scans to avoid re-allocating.
 pub fn scan_once(sys: &mut System, db: &ThreatDb) -> Vec<Finding> {
-    sys.refresh_processes(ProcessesToUpdate::All, true);
+    crate::refresh_process_table(sys);
     let mut findings = Vec::new();
     for (pid, proc_) in sys.processes() {
         let name = proc_.name().to_string_lossy().to_string();
@@ -79,7 +79,8 @@ pub fn run(
     );
     let mut known_pids: std::collections::HashSet<u32> = Default::default();
     while !stop.load(Ordering::Relaxed) {
-        for f in scan_once(&mut sys, db) {
+        let findings = scan_once(&mut sys, db);
+        for f in &findings {
             // Only shout once per pid, so the log isn't flooded each tick.
             if known_pids.insert(f.pid) {
                 log.alert(
@@ -98,9 +99,7 @@ pub fn run(
             }
         }
         // Forget pids that are no longer flagged so a reused pid re-alerts.
-        let live: std::collections::HashSet<u32> =
-            scan_once(&mut sys, db).into_iter().map(|f| f.pid).collect();
-        known_pids.retain(|p| live.contains(p));
+        known_pids.retain(|p| findings.iter().any(|f| f.pid == *p));
         sleep_interruptible(period, &stop);
     }
     log.info("watchdog", "process watchdog stopped");

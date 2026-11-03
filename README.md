@@ -57,8 +57,8 @@ Windows firewall rules require admin/root.
 | Capability | macOS / Linux | Windows |
 |------------|---------------|---------|
 | Browser detection, inspector, scanner, clipper, watchdog, webhook, hosts | ✅ | ✅ |
-| Browser Shield open-handle detection | ✅ (`lsof`) | ⏳ native handle-enumeration module planned |
-| Process freeze/resume | ✅ (SIGSTOP/CONT) | ⏳ `ntdll!NtSuspendProcess` module planned |
+| Browser Shield open-handle detection | ✅ (`lsof`) | ✅ (Restart Manager) |
+| Process freeze/resume | ✅ (SIGSTOP/CONT) | ✅ (`NtSuspendProcess`/`NtResumeProcess`) |
 | Panic network/DNS/session-lock | ✅ | ✅ |
 | Firewall C2 port block | ⏳ pf/nftables module planned | ✅ (`netsh`) |
 | DPI bypass (Discord/Roblox/Wattpad) | — (not applicable) | ✅ (GoodbyeDPI + WinDivert, needs admin) |
@@ -67,9 +67,16 @@ Windows firewall rules require admin/root.
 
 ## Low-RAM design
 
-- One shared `sysinfo::System` reused across scans; bounded (5k) in-memory log.
+- One shared `sysinfo::System` reused across scans, refreshing only process
+  names and exe paths (no per-process CPU/memory/disk sampling); bounded (5k)
+  ring-buffer log.
 - Guards poll on intervals (watchdog 1 s, shield/clipper ~0.4–2 s) rather than
   hooking everything; no continuous full-disk scanning.
+- Files are inspected and scanned in 64 KB chunks, so memory stays flat no
+  matter how large the file is.
+- The dashboard poll is cheap: slow status (process scan, registry, hosts) is
+  cached and re-read only after a change or every 10 s, only the newest 300
+  log lines are sent, and polling pauses while the tab is hidden.
 - The UI renders in your existing browser via a tiny local server, so the
   shield process holds ~15 MB resident instead of bundling a GUI runtime.
 - The legacy native window is behind the `gui` cargo feature; the default build
@@ -83,7 +90,7 @@ blocklist, and can be extended/overridden with a runtime JSON file.
 
 ## Tests
 
-`cargo test` — 60 unit tests cover the pure logic (entropy, hashing, IOC
+`cargo test` — 63 unit tests cover the pure logic (entropy, hashing, IOC
 extraction, hosts-file editing and factory reset, clipper state machine, lsof
 parsing, browser file selection and legitimate-process checks, deception
 revert bookkeeping, session-lock permissions, UI request gating, DPI vendor

@@ -1,17 +1,16 @@
 //! Platform-specific defensive actions, selected at compile time.
 //!
 //! Where a capability has a safe, built-in system command it is driven through
-//! that (kept auditable and dependency-light). Where a capability genuinely
-//! requires native OS APIs not yet wired up (e.g. suspending a process on
-//! Windows via `ntdll!NtSuspendProcess`), the function returns a clear
-//! "planned" error rather than pretending to act.
+//! that (kept auditable and dependency-light). Where only a native OS API will
+//! do (suspending a process on Windows), it is called directly. Capabilities
+//! not wired up yet return a clear "planned" error rather than pretending to act.
 
 use crate::log::EventLog;
 use crate::threat_db::ThreatDb;
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use sysinfo::{ProcessesToUpdate, Signal, System};
+use sysinfo::{Signal, System};
 
 /// Process names (without extension) killed by the panic switch.
 const BROWSERS_AND_MESSENGERS: &[&str] = &[
@@ -25,7 +24,7 @@ const BROWSERS_AND_MESSENGERS: &[&str] = &[
 /// many processes were signalled.
 pub fn kill_browsers_and_messengers(log: &EventLog) -> usize {
     let mut sys = System::new();
-    sys.refresh_processes(ProcessesToUpdate::All, true);
+    crate::refresh_process_table(&mut sys);
     let mut killed = 0;
     for proc_ in sys.processes().values() {
         let name = proc_.name().to_string_lossy().to_ascii_lowercase();
@@ -249,8 +248,8 @@ pub fn firewall_reset(db: &ThreatDb, log: &EventLog) -> Result<usize> {
 /// Fully contain a process caught stealing: freeze it so it cannot continue,
 /// and cut its internet so anything it already read cannot be sent out. On
 /// macOS/Linux the freeze alone stops all transmission; on Windows the
-/// per-program firewall block cuts the network even before the freeze module
-/// lands. Returns true if at least one containment action succeeded.
+/// per-program firewall block also keeps it offline if it is ever resumed.
+/// Returns true if at least one containment action succeeded.
 pub fn contain_process(pid: u32, exe_path: Option<&str>, log: &EventLog) -> bool {
     let mut ok = false;
     match suspend_process(pid, log) {
@@ -318,9 +317,19 @@ pub fn unblock_process_network(exe_path: &str, log: &EventLog) -> Result<()> {
 
 // ----------------------------------------------------------------------- EDR
 
+/// PIDs that must never be frozen: the shield itself (it would hang) and the
+/// OS's own earliest processes (idle/System on Windows, init and kernel
+/// threads on Unix).
+fn freeze_forbidden(pid: u32) -> bool {
+    pid <= 4 || pid == std::process::id()
+}
+
 /// Suspend (freeze) a process without killing it, so e.g. ransomware stops
 /// encrypting while it is analysed.
 pub fn suspend_process(pid: u32, log: &EventLog) -> Result<()> {
+    if freeze_forbidden(pid) {
+        return Err(anyhow!("refusing to freeze pid {pid} (system process or the shield itself)"));
+    }
     #[cfg(unix)]
     {
         run("kill", &["-STOP", &pid.to_string()], log)?;
@@ -329,10 +338,9 @@ pub fn suspend_process(pid: u32, log: &EventLog) -> Result<()> {
     }
     #[cfg(windows)]
     {
-        let _ = (pid, log);
-        Err(anyhow!(
-            "process freeze on Windows requires the native ntdll!NtSuspendProcess module (planned)"
-        ))
+        win::set_suspended(pid, true)?;
+        log.action("edr", format!("suspended pid {pid} (NtSuspendProcess)"));
+        Ok(())
     }
 }
 
@@ -346,10 +354,45 @@ pub fn resume_process(pid: u32, log: &EventLog) -> Result<()> {
     }
     #[cfg(windows)]
     {
-        let _ = (pid, log);
-        Err(anyhow!(
-            "process resume on Windows requires the native ntdll!NtResumeProcess module (planned)"
-        ))
+        win::set_suspended(pid, false)?;
+        log.action("edr", format!("resumed pid {pid} (NtResumeProcess)"));
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+mod win {
+    use anyhow::{anyhow, Result};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SUSPEND_RESUME};
+
+    // Not in the public SDK headers but stable since NT 5; it suspends every
+    // thread of a process in one call, as Process Explorer and Resource
+    // Monitor do. Resolved from ntdll at load time, no import library needed.
+    #[link(name = "ntdll.dll", kind = "raw-dylib", modifiers = "+verbatim")]
+    extern "system" {
+        fn NtSuspendProcess(process: HANDLE) -> i32;
+        fn NtResumeProcess(process: HANDLE) -> i32;
+    }
+
+    pub fn set_suspended(pid: u32, suspend: bool) -> Result<()> {
+        // SAFETY: plain Win32/NT calls on a handle we opened and always close.
+        unsafe {
+            let h = OpenProcess(PROCESS_SUSPEND_RESUME, 0, pid);
+            if h.is_null() {
+                return Err(anyhow!(
+                    "cannot open pid {pid}: {} (already gone, or needs administrator?)",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let status = if suspend { NtSuspendProcess(h) } else { NtResumeProcess(h) };
+            CloseHandle(h);
+            if status < 0 {
+                Err(anyhow!("{} pid {pid} failed (NTSTATUS {status:#010x})", if suspend { "suspend" } else { "resume" }))
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 
@@ -381,6 +424,14 @@ mod tests {
         assert_eq!(a, b, "same path must map to same rule name");
         assert!(a.starts_with("667Shield-NetBlock-"));
         assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    }
+
+    #[test]
+    fn never_freezes_self_or_system_processes() {
+        let log = EventLog::new(false);
+        for pid in [0, 1, 4, std::process::id()] {
+            assert!(suspend_process(pid, &log).is_err(), "pid {pid} must be refused");
+        }
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! Approach (user-mode, low-overhead): periodically ask the OS which processes
 //! currently hold the browser's secret files open. Any opener that is neither
 //! the browser's own process nor the shield is a suspected stealer. When the
-//! shield is *armed*, that process is immediately frozen (SIGSTOP) so it cannot
+//! shield is *armed*, that process is immediately frozen so it cannot
 //! finish reading/exfiltrating, and the user is alerted to decide.
 //!
 //! This is detection-plus-containment, not a kernel filter: it cannot guarantee
@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use sysinfo::{Pid, ProcessesToUpdate, System};
+use sysinfo::{Pid, System};
 
 /// A process found holding a browser secret file open.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,17 +148,56 @@ fn openers_of(path: &str) -> Vec<u32> {
     }
 }
 
-#[cfg(not(unix))]
+/// Which PIDs currently hold `path` open (Windows: via the Restart Manager,
+/// the documented API installers use to find processes locking a file; no
+/// administrator rights or driver needed).
+#[cfg(windows)]
+fn openers_of(path: &str) -> Vec<u32> {
+    use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
+    use windows_sys::Win32::System::RestartManager::{
+        RmEndSession, RmGetList, RmRegisterResources, RmStartSession, CCH_RM_SESSION_KEY, RM_PROCESS_INFO,
+    };
+    let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+    let mut session = 0u32;
+    let mut key = [0u16; CCH_RM_SESSION_KEY as usize + 1];
+    let mut pids = Vec::new();
+    // SAFETY: every buffer outlives the calls that use it, and the session is
+    // always ended.
+    unsafe {
+        if RmStartSession(&mut session, 0, key.as_mut_ptr()) != 0 {
+            return pids;
+        }
+        let files = [wide.as_ptr()];
+        if RmRegisterResources(session, 1, files.as_ptr(), 0, std::ptr::null(), 0, std::ptr::null()) == 0 {
+            let mut infos: Vec<RM_PROCESS_INFO> = Vec::new();
+            // The opener list can grow between the size query and the fetch.
+            for _ in 0..3 {
+                let (mut needed, mut count, mut reasons) = (0u32, infos.len() as u32, 0u32);
+                let buf = if infos.is_empty() { std::ptr::null_mut() } else { infos.as_mut_ptr() };
+                match RmGetList(session, &mut needed, &mut count, buf, &mut reasons) {
+                    0 => {
+                        pids = infos[..count as usize].iter().map(|i| i.Process.dwProcessId).collect();
+                        break;
+                    }
+                    ERROR_MORE_DATA => infos = vec![std::mem::zeroed(); needed as usize],
+                    _ => break,
+                }
+            }
+        }
+        RmEndSession(session);
+    }
+    pids
+}
+
+#[cfg(not(any(unix, windows)))]
 fn openers_of(_path: &str) -> Vec<u32> {
-    // Windows open-handle enumeration (NtQuerySystemInformation /
-    // SystemHandleInformation) is the planned native path; see run().
     Vec::new()
 }
 
 /// One guard pass: return processes (other than the browser and ourselves)
 /// holding any of the browser's secret files open.
 pub fn scan(browser: &Installed, sys: &mut System, self_pid: u32, log: &EventLog) -> Vec<Access> {
-    sys.refresh_processes(ProcessesToUpdate::All, true);
+    crate::refresh_process_table(sys);
     let legit = legitimate_pids(browser, sys);
     let mut found = Vec::new();
     let mut flagged: HashSet<u32> = HashSet::new();
@@ -184,7 +223,8 @@ pub fn scan(browser: &Installed, sys: &mut System, self_pid: u32, log: &EventLog
 }
 
 /// Run the Browser Shield loop until `stop` is set. When `armed`, each detected
-/// intruder is frozen (SIGSTOP) immediately; otherwise it is only reported.
+/// intruder is frozen immediately (SIGSTOP on Unix, NtSuspendProcess on
+/// Windows); otherwise it is only reported.
 pub fn run(
     browser: Installed,
     armed: bool,
@@ -201,11 +241,8 @@ pub fn run(
             browser.secret_files.len()
         ),
     );
-    if !cfg!(unix) {
-        log.warn(
-            "browser-shield",
-            "open-handle detection on this platform needs the native handle-enumeration module (planned)",
-        );
+    if !cfg!(any(unix, windows)) {
+        log.warn("browser-shield", "open-file detection is not available on this platform");
     }
     let mut sys = System::new();
     while !stop.load(Ordering::Relaxed) {
@@ -255,7 +292,7 @@ mod tests {
             secret_files: vec![],
         };
         let mut sys = System::new();
-        sys.refresh_processes(ProcessesToUpdate::All, true);
+        crate::refresh_process_table(&mut sys);
         let legit = legitimate_pids(&browser, &sys);
         // Can't assert specific contents portably; just ensure it runs and the
         // test harness pid (not chrome) is absent.

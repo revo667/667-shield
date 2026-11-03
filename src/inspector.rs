@@ -7,6 +7,7 @@
 use anyhow::{Context, Result};
 use regex::bytes::Regex;
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -76,14 +77,22 @@ fn url_re() -> &'static Regex {
 
 /// Shannon entropy in bits/byte over a byte slice.
 pub fn shannon_entropy(data: &[u8]) -> f64 {
-    if data.is_empty() {
-        return 0.0;
-    }
     let mut counts = [0u64; 256];
+    count_bytes(&mut counts, data);
+    entropy_from_counts(&counts, data.len() as u64)
+}
+
+fn count_bytes(counts: &mut [u64; 256], data: &[u8]) {
     for &b in data {
         counts[b as usize] += 1;
     }
-    let len = data.len() as f64;
+}
+
+fn entropy_from_counts(counts: &[u64; 256], total: u64) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    let len = total as f64;
     let mut h = 0.0;
     for &c in counts.iter() {
         if c == 0 {
@@ -95,31 +104,117 @@ pub fn shannon_entropy(data: &[u8]) -> f64 {
     h
 }
 
-/// Extract embedded webhooks and other URLs from raw bytes.
-pub fn extract_iocs(data: &[u8]) -> (Vec<String>, Vec<String>) {
-    let mut webhooks = Vec::new();
-    for m in webhook_re().find_iter(data) {
-        if let Ok(s) = std::str::from_utf8(m.as_bytes()) {
-            let s = s.to_string();
-            if !webhooks.contains(&s) {
-                webhooks.push(s);
+/// Bytes read per chunk when streaming a file.
+const CHUNK: usize = 64 * 1024;
+/// Bytes carried from one window into the next so an IOC split across a chunk
+/// boundary is still matched whole. Longer than any URL worth reporting.
+const OVERLAP: usize = 4 * 1024;
+
+/// Collects IOCs over successive, overlapping windows of a byte stream.
+#[derive(Default)]
+struct IocCollector {
+    webhooks: Vec<String>,
+    urls: Vec<String>,
+    /// Absolute offset where the last accepted match of each kind ended, so
+    /// the re-read overlap never yields the tail of a match as a new one.
+    webhook_end: u64,
+    url_end: u64,
+}
+
+impl IocCollector {
+    /// Scan `window`, which starts at absolute offset `base`. Unless `last`,
+    /// matches starting in its final [`OVERLAP`] bytes are left for the next
+    /// window (which re-reads those bytes), so none is reported truncated.
+    fn feed(&mut self, window: &[u8], base: u64, last: bool) {
+        let limit = if last { window.len() } else { window.len().saturating_sub(OVERLAP) };
+        for m in webhook_re().find_iter(window) {
+            if m.start() >= limit {
+                break;
             }
-        }
-    }
-    let mut urls = Vec::new();
-    for m in url_re().find_iter(data) {
-        if let Ok(s) = std::str::from_utf8(m.as_bytes()) {
-            // Don't double-report webhooks as generic URLs.
-            if webhooks.iter().any(|w| s.starts_with(w.as_str())) {
+            if base + (m.start() as u64) < self.webhook_end {
                 continue;
             }
-            let s = trim_url(s);
-            if !s.is_empty() && !urls.contains(&s) {
-                urls.push(s);
+            self.webhook_end = base + m.end() as u64;
+            if let Ok(s) = std::str::from_utf8(m.as_bytes()) {
+                let s = s.to_string();
+                if !self.webhooks.contains(&s) {
+                    self.webhooks.push(s);
+                }
+            }
+        }
+        for m in url_re().find_iter(window) {
+            if m.start() >= limit {
+                break;
+            }
+            if base + (m.start() as u64) < self.url_end {
+                continue;
+            }
+            self.url_end = base + m.end() as u64;
+            if let Ok(s) = std::str::from_utf8(m.as_bytes()) {
+                // Don't double-report webhooks as generic URLs.
+                if self.webhooks.iter().any(|w| s.starts_with(w.as_str())) {
+                    continue;
+                }
+                let s = trim_url(s);
+                if !s.is_empty() && !self.urls.contains(&s) {
+                    self.urls.push(s);
+                }
             }
         }
     }
-    (webhooks, urls)
+}
+
+/// Extract embedded webhooks and other URLs from raw bytes.
+pub fn extract_iocs(data: &[u8]) -> (Vec<String>, Vec<String>) {
+    let mut c = IocCollector::default();
+    c.feed(data, 0, true);
+    (c.webhooks, c.urls)
+}
+
+/// Fill `buf` from `r` unless EOF comes first; returns the bytes read.
+fn read_full(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match r.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(n)
+}
+
+/// Stream a file through the IOC collector in fixed-size chunks; `on_chunk`
+/// sees every byte exactly once (for hashing / entropy). Memory stays around
+/// two chunks whatever the file size. Returns the byte count and the IOCs.
+fn stream_file(path: &Path, mut on_chunk: impl FnMut(&[u8])) -> std::io::Result<(u64, IocCollector)> {
+    let mut f = std::fs::File::open(path)?;
+    let mut iocs = IocCollector::default();
+    let mut buf = vec![0u8; CHUNK];
+    let mut window: Vec<u8> = Vec::with_capacity(OVERLAP + CHUNK);
+    let mut base = 0u64; // absolute offset of window[0]
+    let mut size = 0u64;
+    loop {
+        let n = read_full(&mut f, &mut buf)?;
+        let last = n < CHUNK;
+        on_chunk(&buf[..n]);
+        size += n as u64;
+        window.extend_from_slice(&buf[..n]);
+        iocs.feed(&window, base, last);
+        if last {
+            return Ok((size, iocs));
+        }
+        let drop = window.len().saturating_sub(OVERLAP);
+        window.drain(..drop);
+        base += drop as u64;
+    }
+}
+
+/// Extract embedded webhooks and other URLs from a file, streaming it.
+pub fn extract_iocs_from_file(path: &Path) -> std::io::Result<(Vec<String>, Vec<String>)> {
+    let (_, c) = stream_file(path, |_| {})?;
+    Ok((c.webhooks, c.urls))
 }
 
 /// Trim trailing punctuation that regex greedily captured from surrounding
@@ -129,11 +224,24 @@ fn trim_url(s: &str) -> String {
         .to_string()
 }
 
-/// Inspect a file on disk. Reads the whole file into memory; intended for
-/// executables/documents, not multi-gigabyte blobs.
+/// Inspect a file on disk, streaming it in chunks so memory use does not grow
+/// with the file size.
 pub fn inspect(path: &Path) -> Result<Report> {
-    let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(inspect_bytes(&path.display().to_string(), &data))
+    let mut hasher = Sha256::new();
+    let mut counts = [0u64; 256];
+    let (size, iocs) = stream_file(path, |chunk| {
+        hasher.update(chunk);
+        count_bytes(&mut counts, chunk);
+    })
+    .with_context(|| format!("reading {}", path.display()))?;
+    Ok(Report {
+        path: path.display().to_string(),
+        size,
+        sha256: hex(&hasher.finalize()),
+        entropy: entropy_from_counts(&counts, size),
+        webhooks: iocs.webhooks,
+        urls: iocs.urls,
+    })
 }
 
 /// Inspect in-memory bytes (used by disk/temp scanners that already hold data).
@@ -223,5 +331,33 @@ mod tests {
         let blob = b"see http://evil.example/path).";
         let (_wh, urls) = extract_iocs(blob);
         assert_eq!(urls[0], "http://evil.example/path");
+    }
+
+    #[test]
+    fn streaming_matches_in_memory_across_chunk_boundaries() {
+        // IOCs deliberately straddling the chunk and overlap boundaries.
+        let mut data: Vec<u8> = (0..CHUNK * 3 + 777).map(|i| (i * 31 % 251) as u8).collect();
+        let place = |data: &mut Vec<u8>, at: usize, s: &[u8]| data[at..at + s.len()].copy_from_slice(s);
+        place(&mut data, CHUNK - 10, b" https://exo-api.tf/gate/abc ");
+        place(&mut data, 2 * CHUNK - OVERLAP - 5, b" https://discord.com/api/webhooks/123456789012345678/Tok_en-1 ");
+        place(&mut data, 3 * CHUNK - 3, b" https://evil.example/x?u=https://b.example ");
+
+        for len in [data.len(), CHUNK * 2] {
+            let data = &data[..len];
+            let dir = tempfile::tempdir().unwrap();
+            let f = dir.path().join("blob.bin");
+            std::fs::write(&f, data).unwrap();
+
+            let streamed = inspect(&f).unwrap();
+            let whole = inspect_bytes(&f.display().to_string(), data);
+            assert_eq!(whole.webhooks.len(), 1, "fixture must contain the webhook");
+            assert!(whole.urls.iter().any(|u| u == "https://exo-api.tf/gate/abc"));
+            assert_eq!(streamed.size, whole.size);
+            assert_eq!(streamed.sha256, whole.sha256);
+            assert!((streamed.entropy - whole.entropy).abs() < 1e-12);
+            assert_eq!(streamed.webhooks, whole.webhooks);
+            assert_eq!(streamed.urls, whole.urls);
+            assert_eq!(extract_iocs_from_file(&f).unwrap(), (whole.webhooks, whole.urls));
+        }
     }
 }

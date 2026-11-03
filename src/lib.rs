@@ -51,6 +51,19 @@ pub fn process_rss_bytes() -> Option<u64> {
     sys.process(pid).map(|p| p.memory())
 }
 
+/// Refresh the process table with only what the guards use: names and exe
+/// paths (an exe is read once per process, then kept). The default sysinfo
+/// refresh also samples CPU, memory and disk I/O of every process on each
+/// call, which no guard needs — and they run every second or two.
+pub fn refresh_process_table(sys: &mut sysinfo::System) {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_exe(UpdateKind::OnlyIfNotSet),
+    );
+}
+
 /// A one-line description of the current platform target, for the banner.
 pub fn platform_label() -> &'static str {
     if cfg!(windows) {

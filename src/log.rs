@@ -5,6 +5,7 @@
 
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,7 +57,8 @@ impl std::fmt::Display for Event {
 /// one buffer, so subsystems on different threads report into the same log.
 #[derive(Clone)]
 pub struct EventLog {
-    inner: Arc<Mutex<Vec<Event>>>,
+    /// Ring buffer: dropping the oldest event is O(1) once at capacity.
+    inner: Arc<Mutex<VecDeque<Event>>>,
     /// When true, events are also printed to stderr as they arrive (CLI mode).
     echo: bool,
     cap: usize,
@@ -65,7 +67,7 @@ pub struct EventLog {
 impl EventLog {
     pub fn new(echo: bool) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Vec::new())),
+            inner: Arc::new(Mutex::new(VecDeque::new())),
             echo,
             cap: 5000,
         }
@@ -84,10 +86,9 @@ impl EventLog {
         // A poisoned lock means another thread panicked while holding it; the
         // log is non-critical, so recover the guard and keep running.
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.push(ev);
-        if g.len() > self.cap {
-            let overflow = g.len() - self.cap;
-            g.drain(0..overflow);
+        g.push_back(ev);
+        while g.len() > self.cap {
+            g.pop_front();
         }
     }
 
@@ -109,7 +110,16 @@ impl EventLog {
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// A copy of only the newest `n` events, oldest first — what a polling
+    /// view needs, without cloning the whole buffer each time.
+    pub fn tail(&self, n: usize) -> Vec<Event> {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.iter().skip(g.len().saturating_sub(n)).cloned().collect()
     }
 
     pub fn len(&self) -> usize {
@@ -157,5 +167,16 @@ mod tests {
         assert_eq!(log.len(), 10);
         // Oldest dropped: first remaining should be "15".
         assert_eq!(log.snapshot()[0].message, "15");
+    }
+
+    #[test]
+    fn tail_returns_newest_in_order() {
+        let log = EventLog::new(false);
+        for i in 0..5 {
+            log.info("t", format!("{i}"));
+        }
+        let msgs: Vec<String> = log.tail(2).into_iter().map(|e| e.message).collect();
+        assert_eq!(msgs, ["3", "4"]);
+        assert_eq!(log.tail(50).len(), 5);
     }
 }

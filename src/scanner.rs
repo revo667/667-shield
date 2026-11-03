@@ -79,12 +79,12 @@ pub fn scan_root(root: &Path, cfg: &ScanConfig, db: &ThreatDb, log: &EventLog) -
         if meta.len() == 0 || meta.len() > cfg.max_file_size {
             continue;
         }
-        let data = match std::fs::read(entry.path()) {
-            Ok(d) => d,
+        // Streamed in chunks, so memory stays flat even near max_file_size.
+        let (webhooks, urls) = match inspector::extract_iocs_from_file(entry.path()) {
+            Ok(iocs) => iocs,
             Err(_) => continue, // locked / permission denied — skip quietly
         };
         scanned += 1;
-        let (webhooks, urls) = inspector::extract_iocs(&data);
         // Keep only webhooks, plus URLs whose host is a known C2 domain.
         let c2_urls: Vec<String> = urls
             .into_iter()

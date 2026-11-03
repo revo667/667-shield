@@ -462,7 +462,10 @@ document.getElementById("inspBtn").onclick=async()=>{
   document.getElementById("inspOut").textContent=r&&r.ok?r.text:(r&&r.error?("Hata: "+r.error):"denetlenemedi");
 };
 
-buildNav(); go("panel"); refresh(); setInterval(refresh,1500);
+buildNav(); go("panel"); refresh();
+// Don't poll while the tab is hidden; catch up as soon as it is shown again.
+setInterval(()=>{if(!document.hidden)refresh()},1500);
+document.addEventListener("visibilitychange",()=>{if(!document.hidden)refresh()});
 </script>
 </body>
 </html>

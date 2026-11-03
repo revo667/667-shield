@@ -17,7 +17,7 @@ use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Response, Server};
 
 const INDEX_HTML: &str = include_str!("webui_index.html");
@@ -55,6 +55,36 @@ impl Guard {
     }
 }
 
+/// How long status that another program can change (DPI engine started
+/// elsewhere, hosts edited by hand) may be served from cache.
+const SLOW_STATUS_TTL: Duration = Duration::from_secs(10);
+
+/// Status that is expensive to query — a process-table scan, `reg.exe` runs,
+/// a file read. The dashboard polls every 1.5 s, so this is read at startup,
+/// right after the user changes one of these, and otherwise at most every
+/// [`SLOW_STATUS_TTL`].
+struct SlowStatus {
+    at: Instant,
+    dpi: dpi::DpiStatus,
+    deception: deception::DeceptionStatus,
+    shell: shell_integration::ShellStatus,
+    hosts_count: usize,
+}
+
+impl SlowStatus {
+    fn read() -> Self {
+        Self {
+            at: Instant::now(),
+            dpi: dpi::status(),
+            deception: deception::status(),
+            shell: shell_integration::status(),
+            hosts_count: std::fs::read_to_string(hosts::hosts_path())
+                .map(|c| hosts::managed_domain_count(&c))
+                .unwrap_or(0),
+        }
+    }
+}
+
 struct App {
     log: EventLog,
     db: ThreatDb,
@@ -68,6 +98,7 @@ struct App {
     clipper_restore: bool,
     dpi_child: Option<Child>,
     quarantined: bool,
+    slow: SlowStatus,
 }
 
 impl App {
@@ -97,7 +128,13 @@ impl App {
             clipper_restore: true,
             dpi_child: None,
             quarantined: false,
+            slow: SlowStatus::read(),
         }
+    }
+
+    /// Re-read [`SlowStatus`] now, after an action that changed it.
+    fn refresh_slow_status(&mut self) {
+        self.slow = SlowStatus::read();
     }
 
     fn set_shield(&mut self, on: bool) {
@@ -188,12 +225,11 @@ impl App {
     fn state_json(&mut self) -> Value {
         let rss = crate::process_rss_bytes().map(|b| b as f64 / 1048576.0).unwrap_or(0.0);
         let dpi_running = self.dpi_running();
-        let dpi_status = dpi::status();
-        let decep = deception::status();
-        let shell = shell_integration::status();
-        let hosts_count = std::fs::read_to_string(hosts::hosts_path())
-            .map(|c| hosts::managed_domain_count(&c))
-            .unwrap_or(0);
+        if self.slow.at.elapsed() >= SLOW_STATUS_TTL {
+            self.refresh_slow_status();
+        }
+        let SlowStatus { dpi: dpi_status, deception: decep, shell, hosts_count, .. } = &self.slow;
+        let hosts_count = *hosts_count;
         let sel = self.selected;
         let browsers: Vec<Value> = self
             .browsers
@@ -209,11 +245,8 @@ impl App {
             .collect();
         let log: Vec<Value> = self
             .log
-            .snapshot()
+            .tail(300)
             .iter()
-            .rev()
-            .take(300)
-            .rev()
             .map(|e| {
                 json!({
                     "time": e.at.format("%H:%M:%S").to_string(),
@@ -398,6 +431,7 @@ pub fn serve(open: bool) -> anyhow::Result<()> {
                             if let Err(e) = r {
                                 app.log.warn("deception", e.to_string());
                             }
+                            app.refresh_slow_status();
                         }
                     }
                     "hosts" => {
@@ -412,6 +446,7 @@ pub fn serve(open: bool) -> anyhow::Result<()> {
                                 Ok(()) => app.log.action("hosts", if on { "C2 null-routing enabled" } else { "C2 null-routing disabled" }),
                                 Err(e) => app.log.warn("hosts", format!("{e} (need admin/root?)")),
                             }
+                            app.refresh_slow_status();
                         }
                     }
                     _ => {}
@@ -425,6 +460,7 @@ pub fn serve(open: bool) -> anyhow::Result<()> {
                     Some("stop") => app.dpi_stop(),
                     _ => {}
                 }
+                app.refresh_slow_status();
                 json_response(&json!({"ok": true}))
             }
             (Method::Post, "/api/freeze") => {
@@ -453,6 +489,7 @@ pub fn serve(open: bool) -> anyhow::Result<()> {
                 if let Err(e) = r {
                     app.log.warn("shell", e.to_string());
                 }
+                app.refresh_slow_status();
                 json_response(&json!({"ok": true}))
             }
             (Method::Post, "/api/dns-reset") => {
@@ -465,6 +502,7 @@ pub fn serve(open: bool) -> anyhow::Result<()> {
                     Ok(None) => app.log.action("hosts", "DNS factory reset — managed block removed"),
                     Err(e) => app.log.warn("hosts", format!("{e} (need admin/root?)")),
                 }
+                app.refresh_slow_status();
                 json_response(&json!({"ok": true}))
             }
             (Method::Post, "/api/panic") => {

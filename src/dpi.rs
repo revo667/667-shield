@@ -58,9 +58,8 @@ fn engine_exe(dir: &std::path::Path) -> PathBuf {
 
 /// Is the GoodbyeDPI engine process currently running?
 pub fn is_running() -> bool {
-    use sysinfo::{ProcessesToUpdate, System};
-    let mut sys = System::new();
-    sys.refresh_processes(ProcessesToUpdate::All, true);
+    let mut sys = sysinfo::System::new();
+    crate::refresh_process_table(&mut sys);
     sys.processes().values().any(|p| {
         let n = p.name().to_string_lossy().to_ascii_lowercase();
         n == "goodbyedpi.exe" || n == "goodbyedpi"

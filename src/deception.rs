@@ -16,7 +16,9 @@
 //!     warning before enabling it.
 
 use crate::log::EventLog;
-use anyhow::{anyhow, Result};
+#[cfg(not(windows))]
+use anyhow::anyhow;
+use anyhow::Result;
 
 /// A registry marker: (key, value name, value type, value data). Chosen from
 /// classic VM-presence checks that live under SOFTWARE (not hardware/ACPI), so
