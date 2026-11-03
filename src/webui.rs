@@ -102,8 +102,8 @@ struct App {
 }
 
 impl App {
-    fn new() -> Self {
-        let log = EventLog::new(false);
+    fn new(echo_log: bool) -> Self {
+        let log = EventLog::new(echo_log);
         let db = ThreatDb::embedded().unwrap_or_else(|_| ThreatDb {
             version: "none".into(),
             note: String::new(),
@@ -130,6 +130,23 @@ impl App {
             quarantined: false,
             slow: SlowStatus::read(),
         }
+    }
+
+    /// The protection a double-clicked exe turns on by itself: only guards that
+    /// need no administrator rights and leave normal use untouched. System-wide
+    /// changes (hosts, deception, DPI, panic) stay one click away in the UI.
+    fn start_default_guards(&mut self) {
+        self.set_watchdog(true);
+        self.set_clipper(true);
+        let mut on = vec!["process watchdog", "clipboard guard"];
+        match self.browsers.get(self.selected) {
+            Some(_) => {
+                self.set_shield(true);
+                on.push("Browser Shield");
+            }
+            None => self.log.info("ui", "no browser with saved secrets found — Browser Shield idle"),
+        }
+        self.log.action("ui", format!("background protection on: {}", on.join(", ")));
     }
 
     /// Re-read [`SlowStatus`] now, after an action that changed it.
@@ -337,23 +354,70 @@ fn request_allowed(host: Option<&str>, origin: Option<&str>, token: Option<&str>
     token.is_some_and(|t| constant_time_eq(t.as_bytes(), expected.as_bytes()))
 }
 
-/// Start the UI server and open it in the browser. Blocks until the process exits.
-pub fn serve(open: bool) -> anyhow::Result<()> {
-    let mut app = App::new();
+/// Ports the UI may listen on (the first free one is used).
+fn ui_ports() -> std::ops::Range<u16> {
+    6670..6680
+}
+
+/// Does this HTTP body look like our dashboard page?
+fn is_dashboard_page(body: &str) -> bool {
+    body.contains("<title>667 Shield</title>") && body.contains("const TOKEN=\"")
+}
+
+/// URL of a 667 Shield dashboard already running on this machine, if any, so a
+/// second launch just shows it instead of starting a second, competing shield.
+pub fn running_instance() -> Option<String> {
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_millis(500)).build();
+    ui_ports().find_map(|p| {
+        let url = format!("http://127.0.0.1:{p}");
+        let body = agent.get(&url).call().ok()?.into_string().ok()?;
+        is_dashboard_page(&body).then_some(url)
+    })
+}
+
+/// How [`serve`] starts.
+pub struct ServeOptions {
+    /// Open the dashboard in the default browser once the server is up.
+    pub open_browser: bool,
+    /// Turn on the default background guards right away (double-click mode).
+    pub start_guards: bool,
+    /// Print events to the console as they happen.
+    pub echo_log: bool,
+}
+
+/// Start the UI server and open it in the browser. Blocks until the process
+/// exits. If a shield is already running, just shows its dashboard.
+pub fn serve(opts: ServeOptions) -> anyhow::Result<()> {
+    if let Some(url) = running_instance() {
+        println!("667 Shield is already running → {url}");
+        if opts.open_browser {
+            open_browser(&url);
+        }
+        return Ok(());
+    }
+
+    let mut app = App::new(opts.echo_log);
     let token = new_token()?;
     let index_html = INDEX_HTML.replace(TOKEN_PLACEHOLDER, &token);
 
-    // Bind the first free port in a small range so a second instance still comes up.
-    let server = (6670..6680)
+    // Bind the first free port in a small range, in case one is taken.
+    let server = ui_ports()
         .find_map(|p| Server::http(("127.0.0.1", p)).ok())
         .ok_or_else(|| anyhow::anyhow!("no free port in 6670..6680 for the UI"))?;
     let addr = server.server_addr();
     let port = addr.to_ip().map(|a| a.port()).unwrap_or(6670);
     let url = format!("http://127.0.0.1:{port}");
 
-    println!("667 Shield UI → {url}");
-    println!("(Press Ctrl+C to stop)");
-    if open {
+    if opts.start_guards {
+        app.start_default_guards();
+        println!("667 Shield is protecting this computer in the background.");
+        println!("Dashboard → {url}");
+        println!("Keep this window open; closing it stops the protection.");
+    } else {
+        println!("667 Shield UI → {url}");
+        println!("(Press Ctrl+C to stop)");
+    }
+    if opts.open_browser {
         open_browser(&url);
     }
 
@@ -587,6 +651,13 @@ mod tests {
         assert!(!request_allowed(Some("evil.example:6670"), None, None, "/", 6670, T));
         assert!(!request_allowed(None, None, Some(T), "/api/state", 6670, T));
         assert!(!request_allowed(Some("127.0.0.1:6671"), None, Some(T), "/api/state", 6670, T));
+    }
+
+    #[test]
+    fn recognises_only_our_dashboard() {
+        assert!(is_dashboard_page(&INDEX_HTML.replace(TOKEN_PLACEHOLDER, "abc")));
+        assert!(!is_dashboard_page("<html><title>Some other app</title></html>"));
+        assert!(!is_dashboard_page("{\"error\":\"forbidden\"}"));
     }
 
     #[test]

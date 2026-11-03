@@ -3,6 +3,9 @@
 //! Deliberately dependency-light (no arg-parser crate) to keep the binary and
 //! its resident footprint small. The GUI lives behind the `gui` cargo feature
 //! so the default build stays lean.
+//!
+//! Started with no arguments (e.g. double-clicking the exe) it runs `run`:
+//! background protection plus the dashboard.
 
 use shield667::{
     browser_shield, browsers, clipboard, hosts, inspector, platform, scanner, watchdog,
@@ -16,7 +19,7 @@ use sysinfo::System;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = args.first().map(String::as_str).unwrap_or("help");
+    let cmd = args.first().map(String::as_str).unwrap_or("run");
     let rest = &args[args.len().min(1)..];
     let log = EventLog::new(true); // echo events to stderr in CLI mode
 
@@ -29,6 +32,7 @@ fn main() {
     };
 
     let code = match cmd {
+        "run" => cmd_run(args.is_empty()),
         "ui" => cmd_ui(),
         "status" => cmd_status(&db),
         "inspect" => cmd_inspect(rest),
@@ -74,8 +78,27 @@ fn banner() {
     );
 }
 
+/// Background protection plus the dashboard. `launched_bare` is true when
+/// started with no arguments, as by a double-click: then the console window
+/// closes as soon as we exit, so an error waits for Enter to stay readable.
+fn cmd_run(launched_bare: bool) -> i32 {
+    let opts = shield667::webui::ServeOptions { open_browser: true, start_guards: true, echo_log: true };
+    match shield667::webui::serve(opts) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("667 Shield could not start: {e:#}");
+            if launched_bare {
+                eprintln!("Press Enter to close.");
+                let _ = std::io::stdin().read_line(&mut String::new());
+            }
+            1
+        }
+    }
+}
+
 fn cmd_ui() -> i32 {
-    match shield667::webui::serve(true) {
+    let opts = shield667::webui::ServeOptions { open_browser: true, start_guards: false, echo_log: false };
+    match shield667::webui::serve(opts) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("UI failed: {e:#}");
@@ -418,9 +441,11 @@ fn print_help() {
     banner();
     println!(
         r#"
-usage: shield667 <command> [args]
+usage: shield667 [command] [args]
 
-  ui                         launch the modern dashboard in your browser
+  (no command) / run         start background protection and open the dashboard
+                             (watchdog, Browser Shield, clipboard guard)
+  ui                         open the dashboard only, all guards off
 
 inspection & detection
   status                     overview: signatures, hosts, browsers, live threats

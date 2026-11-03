@@ -32,9 +32,21 @@ the shield process itself idles around ~15 MB — a fraction of a commercial AV.
 
 ```sh
 cargo build --release
+```
 
-# Modern dashboard — opens in your browser (recommended)
-./target/release/shield667 ui
+On Windows this produces `target\release\shield667.exe`. **Double-click it**:
+background protection starts (process watchdog, Browser Shield for the first
+detected browser, clipboard guard) and the dashboard opens in your browser. A
+console window stays open showing what the shield does; closing it stops the
+protection. Opening the exe again while it runs just shows the dashboard of
+the running shield instead of starting a second one. Guards that change the
+system (hosts null-routing, deception, DPI bypass, panic) stay off until you
+turn them on in the dashboard.
+
+```sh
+# Same from a terminal (any platform)
+./target/release/shield667            # = shield667 run
+./target/release/shield667 ui         # dashboard only, all guards off
 
 # Or drive it from the command line
 ./target/release/shield667 status
@@ -90,7 +102,7 @@ blocklist, and can be extended/overridden with a runtime JSON file.
 
 ## Tests
 
-`cargo test` — 63 unit tests cover the pure logic (entropy, hashing, IOC
+`cargo test` — 64 unit tests cover the pure logic (entropy, hashing, IOC
 extraction, hosts-file editing and factory reset, clipper state machine, lsof
 parsing, browser file selection and legitimate-process checks, deception
 revert bookkeeping, session-lock permissions, UI request gating, DPI vendor
